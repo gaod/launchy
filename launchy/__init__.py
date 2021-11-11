@@ -11,12 +11,22 @@ import shlex
 from sys import argv
 import signal
 import functools
+from time import sleep
+
+
+async def queue_reader(queue, handler):
+    while True:
+        line = await queue.get()
+        if line is None:
+            break
+        await handler(line)
 
 
 class Launchy:
     _processes = []
 
-    def __init__(self, command, out_handler=None, err_handler=None, on_exit=None, **subprocessargs):
+    def __init__(self, command, out_handler=None, err_handler=None, on_exit=None, buffered=True, collect_time=0,
+                 **subprocessargs):
         if isinstance(command, list):
             self.args = command
             self.command = " ".join(command)
@@ -24,6 +34,8 @@ class Launchy:
             self.command = command
             self.args = shlex.split(command)
 
+        self.buffered = buffered
+        self.collect_time = collect_time
         self.subprocessargs = subprocessargs
         self.return_code = None
         self.transport = None
@@ -31,6 +43,8 @@ class Launchy:
         self.cmd_done = asyncio.Future()
         self.terminated = asyncio.Future()
         self.reading_done = asyncio.Future()
+        self.stdout_queue = asyncio.Queue()
+        self.stderr_queue = asyncio.Queue()
 
         if out_handler:
             self.out_handler = out_handler
@@ -45,11 +59,11 @@ class Launchy:
         else:
             self.on_exit = self.__on_exit
 
-    async def __out_handler(self, line):
-        print("out:", line)
+    async def __out_handler(self, data):
+        print("out:", data)
 
-    async def __err_handler(self, line):
-        print("err:", line)
+    async def __err_handler(self, data):
+        print("err:", data)
 
     async def __on_exit(self, ret):
         pass
@@ -78,22 +92,32 @@ class Launchy:
 
             def pipe_data_received(self, fd, data):
                 data = data.decode('utf8')
-                if fd not in self.remainder:
-                    self.remainder[fd] = ""
-                if self.remainder[fd]:
-                    data = self.remainder[fd] + data
-                    self.remainder[fd] = ""
-                data = data.replace('\r', '\n')
-                lines = data.split('\n')
-                if lines[-1] == '':
-                    lines.pop()
-                else:
-                    self.remainder[fd] = lines.pop()
-                for line in lines:
-                    if fd == 1:
-                        asyncio.gather(self.launchy.out_handler(line))
+                if self.launchy.buffered:
+                    if fd not in self.remainder:
+                        self.remainder[fd] = ""
+                    if self.remainder[fd]:
+                        data = self.remainder[fd] + data
+                        self.remainder[fd] = ""
+
+                    lines = data.split('\n')
+                    if lines[-1] == '':
+                        lines.pop()
                     else:
-                        asyncio.gather(self.launchy.err_handler(line))
+                        self.remainder[fd] = lines.pop()
+
+                    for line in lines:
+                        if fd == 1:
+                            loop.call_soon(self.launchy.stdout_queue.put_nowait, line)
+                        else:
+                            loop.call_soon(self.launchy.stderr_queue.put_nowait, line)
+
+                else:  # unbuffered
+                    if fd == 1:
+                        loop.call_soon(self.launchy.stdout_queue.put_nowait, data)
+                    else:
+                        loop.call_soon(self.launchy.stderr_queue.put_nowait, data)
+                    if self.launchy.collect_time:
+                        sleep(self.launchy.collect_time)
 
             def process_exited(self):
                 self.launchy.cmd_done.set_result(True)
@@ -102,11 +126,14 @@ class Launchy:
                 self.launchy.reading_done.set_result(True)
 
         async def bkg(self):
+            out_task = loop.create_task(queue_reader(self.stdout_queue, self.out_handler))
+            err_task = loop.create_task(queue_reader(self.stderr_queue, self.err_handler))
+
             try:
                 self.transport, protocol = await self.create
             except Exception as exc:
-                asyncio.gather(self.err_handler("Error launching process: %s" % self.command))
-                asyncio.gather(self.err_handler(str(exc)))
+                loop.call_soon(self.stderr_queue.put_nowait, "Error launching process: %s" % self.command)
+                loop.call_soon(self.stderr_queue.put_nowait, str(exc))
                 Launchy._processes.remove(self)
                 self.started.set_result(False)
                 self.terminated.set_result(-1)
@@ -115,6 +142,10 @@ class Launchy:
             self.started.set_result(True)
             await self.reading_done
             await self.cmd_done
+            await self.stdout_queue.put(None)
+            await self.stderr_queue.put(None)
+            await out_task
+            await err_task
 
             Launchy._processes.remove(self)
             return_code = self.transport.get_returncode()
@@ -143,13 +174,15 @@ class Launchy:
         if self.transport:
             self.transport.terminate()
         else:
-            asyncio.gather(self.err_handler("terminate: no transport"))
+            loop = asyncio.get_event_loop()
+            loop.call_soon(self.stderr_queue.put_nowait, "terminate: no transport")
 
     def kill(self):
         if self.transport:
             self.transport.kill()
         else:
-            asyncio.gather(self.err_handler("kill: no transport"))
+            loop = asyncio.get_event_loop()
+            loop.call_soon(self.stderr_queue.put_nowait, "kill: no transport")
 
     @classmethod
     async def stop(self):
